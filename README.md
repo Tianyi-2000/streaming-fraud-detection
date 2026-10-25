@@ -85,8 +85,8 @@ pip install -r requirements.txt
 docker compose up -d
 docker compose ps                      # wait for redpanda to report "healthy"
 
-# 2. Topics (idempotent)
-docker exec redpanda rpk topic create play-events track-activity -p 3 -r 1
+# 2. Topics: 3 partitions each, write caching off (safe to re-run)
+python3 src/create_topics.py
 
 # 3. Start clean. The dedup journal in state/ survives a broker wipe by design,
 #    so always clear it when you start over.
@@ -213,6 +213,27 @@ python3 -m pytest tests/ -q      # 408 tests
 
 Tests that need a live broker: `test_two_key_proof.py`, `test_consumer_stage1_e2e.py`, `test_consumer_stage2_e2e.py`, `test_harness_roundtrip.py`. Everything else runs with no broker and no network.
 
+## Broker crash test
+
+`acks=all` was not enough. Killing the broker (SIGKILL) partway through a 2,000 events/s replay lost acknowledged events: 15 to 133 per run. The producer reported zero delivery failures every time. The cause is that the Redpanda image runs in developer mode, which acknowledges a write from memory before it reaches disk.
+
+| Setup | Crash runs | Events lost | Duplicates |
+|---|---|---|---|
+| Before: `acks=all` only | 9 | 15 to 133 in every run | 0 |
+| Write caching off only | 9 | 0 | 11 in one run |
+| Idempotence only | 7 | producer stops with a fatal error | n/a |
+| Both (shipped) | 11 | 0 | 0 |
+
+The fix is two settings:
+- `write.caching=false` on both topics, in `src/create_topics.py`.
+- `enable.idempotence=true` on the producer, in `src/replay_to_kafka.py`.
+
+What it costs:
+- Turning write caching off cost no measurable throughput.
+- Idempotence adds a one-time wait of about half a second while the producer obtains its producer id. That takes the full 45,473-event replay from 0.38 s to 0.84 s.
+
+The test ran on a single node with replication factor 1. A 3-replica production topic would usually survive one broker crash anyway. Method, raw results and the harness are in [`bench/BENCHMARK_RESULTS.md`](bench/BENCHMARK_RESULTS.md).
+
 ## Repository layout
 
 ```
@@ -231,6 +252,7 @@ src/summarize_review_queue.py      bounded LLM reviewer notes with template fall
 src/dashboard.py                   Streamlit dashboard
 src/build_dashboard_html.py        static HTML dashboard
 connect/                           Kafka Connect sink configs and setup
+bench/                             producer benchmarks and the broker crash test
 config/                            detection thresholds
 data/                              cached catalog, event stream, manifest
 tests/                             408 tests
@@ -242,6 +264,7 @@ docker-compose.yml                 Redpanda + console; ArangoDB and Connect behi
 - [`DESIGN-two-key-pipeline.md`](DESIGN-two-key-pipeline.md): why two partition keys, with the production argument
 - [`GRAPH.md`](GRAPH.md): the graph layer, replay idempotency, and both cohort queries
 - [`connect/README.md`](connect/README.md): the Kafka Connect path and connector provenance
+- [`bench/BENCHMARK_RESULTS.md`](bench/BENCHMARK_RESULTS.md): producer throughput, latency, and the broker crash test behind the durability settings
 - [`PRODUCER-CONSUMER-CONTRACT.md`](PRODUCER-CONSUMER-CONTRACT.md) and [`CONTRACT-DECISIONS.md`](CONTRACT-DECISIONS.md): the event contract and the decisions behind the thresholds
 - [`RESEARCH-artificial-streaming-fraud.md`](RESEARCH-artificial-streaming-fraud.md): the fraud mechanics this design is based on
 - [`DEMO.md`](DEMO.md): an end-to-end walkthrough from a wiped broker, with timings
