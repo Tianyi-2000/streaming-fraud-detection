@@ -13,3 +13,6 @@ state/
 # GSD planning artifacts (local only)
 .planning/
 .gsd-ingest-manifest.yaml
+
+# Scratch input the bench writes for the malformed-event test.
+bench/mixed_events.jsonl

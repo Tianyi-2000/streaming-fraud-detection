@@ -8,6 +8,12 @@ Both topics are created with 3 partitions -- not 1 -- so the Phase 6 demo can
 visibly show different keys landing on different partitions, which is the whole
 point of the two-key pipeline.
 
+Both topics also turn write caching off. The Redpanda image starts in developer
+mode, where an acks=all write is acknowledged from memory before it reaches
+disk, so a broker crash loses events the producer was told were safe. The crash
+tests in bench/BENCHMARK_RESULTS.md measured that loss, and its absence once
+this setting and producer idempotence are both on.
+
 Usage:
     # make sure the broker is up first:  docker compose up -d
     python src/create_topics.py
@@ -22,7 +28,14 @@ import time
 from pathlib import Path
 
 from confluent_kafka import KafkaError, KafkaException
-from confluent_kafka.admin import AdminClient, NewTopic
+from confluent_kafka.admin import (
+    AdminClient,
+    AlterConfigOpType,
+    ConfigEntry,
+    ConfigResource,
+    NewTopic,
+    ResourceType,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -34,6 +47,8 @@ from contracts.play_event_v1 import (  # noqa: E402
 PARTITIONS = 3
 REPLICATION_FACTOR = 1
 TOPICS = [TOPIC_PLAY_EVENTS, TOPIC_TRACK_ACTIVITY]
+# fsync before ack. Costs no measurable throughput on this stream (see bench/).
+TOPIC_CONFIG = {"write.caching": "false"}
 
 # How long to wait for a freshly created topic to show up in cluster metadata.
 _METADATA_TIMEOUT_SECONDS = 30.0
@@ -49,6 +64,41 @@ def _partition_counts(admin: AdminClient, topics: list[str]) -> dict[str, int]:
     }
 
 
+def _apply_topic_config(admin: AdminClient, topics: list[str]) -> None:
+    """Set TOPIC_CONFIG on every topic, then check what the broker reports.
+
+    Creation is skipped for a topic that already exists, so a topic made before
+    this setting was added would quietly keep write caching on. The setting is
+    therefore applied on every run (a SET is idempotent), and the value is read
+    back from the broker instead of trusting that the request took effect.
+    """
+    entries = [
+        ConfigEntry(key, value, incremental_operation=AlterConfigOpType.SET)
+        for key, value in TOPIC_CONFIG.items()
+    ]
+    resources = [
+        ConfigResource(ResourceType.TOPIC, name, incremental_configs=entries)
+        for name in topics
+    ]
+    for future in admin.incremental_alter_configs(resources).values():
+        future.result()
+
+    described = admin.describe_configs(
+        [ConfigResource(ResourceType.TOPIC, name) for name in topics]
+    )
+    for resource, future in described.items():
+        actual = future.result()
+        wrong = {
+            key: actual[key].value if key in actual else None
+            for key, value in TOPIC_CONFIG.items()
+            if key not in actual or actual[key].value != value
+        }
+        if wrong:
+            raise RuntimeError(
+                f"topic '{resource.name}' reports {wrong} after setting {TOPIC_CONFIG}"
+            )
+
+
 def ensure_topics(broker: str = "localhost:9092") -> list[str]:
     """Idempotently create both topics; return the names confirmed on the broker.
 
@@ -62,7 +112,12 @@ def ensure_topics(broker: str = "localhost:9092") -> list[str]:
     admin = AdminClient({"bootstrap.servers": broker})
 
     new_topics = [
-        NewTopic(name, num_partitions=PARTITIONS, replication_factor=REPLICATION_FACTOR)
+        NewTopic(
+            name,
+            num_partitions=PARTITIONS,
+            replication_factor=REPLICATION_FACTOR,
+            config=TOPIC_CONFIG,
+        )
         for name in TOPICS
     ]
     for name, future in admin.create_topics(new_topics).items():
@@ -103,8 +158,10 @@ def ensure_topics(broker: str = "localhost:9092") -> list[str]:
             "&& python src/create_topics.py"
         )
 
+    _apply_topic_config(admin, TOPICS)
+
     for name in TOPICS:
-        print(f"confirmed '{name}': {counts[name]} partitions")
+        print(f"confirmed '{name}': {counts[name]} partitions, {TOPIC_CONFIG}")
     return list(TOPICS)
 
 

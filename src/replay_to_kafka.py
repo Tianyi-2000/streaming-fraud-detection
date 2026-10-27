@@ -31,16 +31,22 @@ sys.path.insert(0, str(REPO_ROOT))
 from contracts.play_event_v1 import PlayEventV1, play_events_key  # noqa: E402
 
 
+# Durability is measured, not assumed: see bench/BENCHMARK_RESULTS.md.
+# With acks=all alone, killing the broker mid-replay lost acked events, and the
+# script still reported zero failures. Two settings fix it. The topic setting in
+# create_topics.py makes an ack mean "on disk". Idempotence, here, numbers every
+# batch: the broker drops a duplicate retry, and a gap in the sequence stops the
+# producer with a fatal error instead of passing silently.
+PRODUCER_CONFIG = {
+    "linger.ms": 20,  # batches sends for bulk replay; ~5 ms suits a live trickle
+    "acks": "all",
+    "enable.idempotence": True,
+    "client.id": "play-events-replay",
+}
+
+
 def build_producer(broker: str) -> Producer:
-    # linger.ms batches sends for throughput; acks=all for durability.
-    return Producer(
-        {
-            "bootstrap.servers": broker,
-            "linger.ms": 20,
-            "acks": "all",
-            "client.id": "play-events-replay",
-        }
-    )
+    return Producer({"bootstrap.servers": broker, **PRODUCER_CONFIG})
 
 
 def main() -> int:
