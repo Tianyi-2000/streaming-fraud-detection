@@ -336,6 +336,24 @@ def verdict_terms_in(document: Any) -> List[str]:
     ]
 
 
+# Fields that echo a filesystem path the operator passed in. A path says where
+# the checkout lives, not what the report concludes, and the default clone folder
+# is `streaming-fraud-detection`: `-fraud-` matches `\bfraud\b`, so scanning these
+# made every default run on a fresh clone refuse to write. They are left out of
+# the scan only; the report still records them exactly as given.
+OPERATOR_PATH_FIELDS = ("listener_read_from", "track_read_from")
+
+
+def guarded_view(document: Dict[str, Any]) -> Dict[str, Any]:
+    """The report as the no-verdict guard reads it: everything but operator paths."""
+    seeds = document.get("seeds")
+    if not isinstance(seeds, dict):
+        return document
+    view = dict(document)
+    view["seeds"] = {k: v for k, v in seeds.items() if k not in OPERATOR_PATH_FIELDS}
+    return view
+
+
 def serialize_report(document: Dict[str, Any]) -> str:
     """Deterministic serialization, matching `write_review_queue`'s idiom.
 
@@ -628,7 +646,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # THE BOUND, ENFORCED RATHER THAN INTENDED. If a verdict term ever reaches
     # this document the run fails instead of writing it.
-    offending = verdict_terms_in(document)
+    offending = verdict_terms_in(guarded_view(document))
     if offending:
         print(
             f"ERROR: the cohort report contains verdict language {offending}. "

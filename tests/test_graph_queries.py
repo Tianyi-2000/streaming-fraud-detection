@@ -444,3 +444,135 @@ def test_the_normal_pairwise_baseline_is_far_below_the_cohort(
     mean = sum(overlaps) / len(overlaps)
     assert mean < 5, f"normal pairwise mean {mean} is not a normal baseline"
     assert max(overlaps) <= 25
+
+
+# --- Fresh clone: the default folder name contains "fraud" -------------------
+#
+# The default clone folder is `streaming-fraud-detection`, and the report records
+# the absolute paths its seeds were read from. `-fraud-` matches `\bfraud\b`, so
+# the guard used to refuse every default run on a fresh clone (exit 4). The guard
+# now skips those operator-supplied path fields and nothing else.
+
+FRAUD_FOLDER = "streaming-fraud-detection"
+
+
+def _offline_body(note: str = "a candidate for human review") -> Dict[str, Any]:
+    """The minimum `run_queries` shape `main` prints, with no database behind it."""
+    return {
+        "co_listening": {
+            "seed_listener": "L1",
+            "min_shared_distinct_tracks": 100,
+            "peers_over_threshold": 0,
+            "peers": [],
+            "cohort_lowest_shared_distinct_tracks": 0,
+            "highest_shared_distinct_tracks_outside_flagged_set": 0,
+            "separation_note": note,
+        },
+        "fan_in": {
+            "seed_track": "T1",
+            "inbound_distinct_listeners": 0,
+            "single_play_single_track_listeners": 0,
+            "cohort": [],
+        },
+        "baseline": {
+            "pairs_compared": 0,
+            "mean_shared_distinct_tracks": 0.0,
+            "max_shared_distinct_tracks": 0,
+        },
+    }
+
+
+def _run_main_in_fraud_folder(tmp_path, monkeypatch, body):
+    import arango
+    import src.graph_queries as gq
+
+    out_dir = tmp_path / FRAUD_FOLDER / "output"
+    out_dir.mkdir(parents=True)
+    listener_queue = out_dir / "listener_review_queue.json"
+    track_queue = out_dir / "track_review_queue.json"
+    listener_queue.write_text(
+        json.dumps({"flagged_listeners": [{"listener_id": "L1"}]})
+    )
+    track_queue.write_text(json.dumps({"flagged_tracks": [{"track_id": "T1"}]}))
+    report = out_dir / "cohort_report.json"
+
+    class _NoDatabase:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def db(self, *args, **kwargs):
+            return object()
+
+    monkeypatch.setattr(arango, "ArangoClient", _NoDatabase)
+    monkeypatch.setattr(gq, "run_queries", lambda db, **kwargs: body)
+    monkeypatch.setattr(
+        gq,
+        "graph_state",
+        lambda db: {
+            LISTENERS_COLLECTION: 0,
+            TRACKS_COLLECTION: 0,
+            PLAYED_COLLECTION: 0,
+            "dangling_edges": 0,
+        },
+    )
+    code = gq.main(
+        [
+            "--listener-queue", str(listener_queue),
+            "--track-queue", str(track_queue),
+            "--out", str(report),
+        ]
+    )
+    return code, report, listener_queue
+
+
+def test_a_checkout_folder_named_fraud_does_not_trip_the_guard(tmp_path, monkeypatch):
+    code, report, listener_queue = _run_main_in_fraud_folder(
+        tmp_path, monkeypatch, _offline_body()
+    )
+    assert code == 0
+    written = json.loads(report.read_text())
+    # Recorded exactly as given: the fix narrows the scan, not the artifact.
+    assert written["seeds"]["listener_read_from"] == str(listener_queue)
+    assert FRAUD_FOLDER in written["seeds"]["listener_read_from"]
+
+
+def test_the_guard_still_refuses_verdict_language_in_prose(tmp_path, monkeypatch):
+    """Skipping the path fields must not open a hole anywhere else."""
+    code, report, _ = _run_main_in_fraud_folder(
+        tmp_path, monkeypatch, _offline_body(note="this cohort is fraud")
+    )
+    assert code == 4
+    assert not report.exists()
+
+
+def test_graph_queries_runs_with_defaults_from_a_folder_named_fraud(graph, tmp_path):
+    """The real script, no arguments, from a checkout whose folder contains "fraud"."""
+    import shutil
+    import subprocess
+
+    if not LISTENER_QUEUE.exists() or not TRACK_QUEUE.exists():
+        pytest.skip(f"review queues absent. {REGENERATE_HINT}")
+
+    checkout = tmp_path / FRAUD_FOLDER
+    for package in ("src", "contracts"):
+        shutil.copytree(
+            REPO_ROOT / package,
+            checkout / package,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+    (checkout / "output").mkdir()
+    shutil.copy(LISTENER_QUEUE, checkout / "output")
+    shutil.copy(TRACK_QUEUE, checkout / "output")
+
+    result = subprocess.run(
+        [sys.executable, str(checkout / "src" / "graph_queries.py")],
+        cwd=checkout,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stderr
+    written = json.loads((checkout / "output" / "cohort_report.json").read_text())
+    expected = (checkout / "output" / "listener_review_queue.json").resolve()
+    assert written["seeds"]["listener_read_from"] == str(expected)
